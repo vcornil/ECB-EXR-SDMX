@@ -1,0 +1,12 @@
+sdmx1
+packaging
+pandas
+numpy
+tabulate
+fpdf2
+openpyxl
+pandas-stubs
+types-tabulate
+types-fpdf2
+types-openpyxl
+pytest
