@@ -16,16 +16,21 @@ import sys
 
 class Ecbexr:
     # Class constants
-    SDMX_CLIENT = "ECB"
-    SDMX_DATASET = "EXR"
-    SDMX_DAILY_KEY = "D..EUR.SP00.A"  # Daily data
-    SDMX_MONTHLY_KEY = "M..EUR.SP00.A"  # Monthly data
+    # Default to IMF provider; can be overridden per-instance
+    SDMX_CLIENT = "IMF_DATA"
+    SDMX_DATASET = "IFS"
+    SDMX_DAILY_KEY = None  # IMF typically exposes monthly series; set to None to skip daily by default
+    SDMX_MONTHLY_KEY = None
 
     def __init__(
         self,
         target_year: int | None = None,
         target_month: int | None = None,
         from_month: int | None = None,
+        provider: str | None = None,
+        dataset: str | None = None,
+        daily_key: str | None = None,
+        monthly_key: str | None = None,
     ):
 
         # initialize internal variables
@@ -63,6 +68,17 @@ class Ecbexr:
             self._end_year
             if self.start_month <= self.end_month
             else (self._end_year - 1)
+        )
+
+        # SDMX provider / dataset / key overrides (useful to target IMF, ECB, etc.)
+        self.sdmx_provider = provider or Ecbexr.SDMX_CLIENT
+        self.sdmx_dataset = dataset or Ecbexr.SDMX_DATASET
+        # If daily_key is None, daily retrieval will be skipped
+        self.sdmx_daily_key = (
+            daily_key if daily_key is not None else Ecbexr.SDMX_DAILY_KEY
+        )
+        self.sdmx_monthly_key = (
+            monthly_key if monthly_key is not None else Ecbexr.SDMX_MONTHLY_KEY
         )
 
     # Getter for the end year
@@ -137,8 +153,8 @@ class Ecbexr:
             dict: Dictionary with currency codes as keys and rate info as values
         """
 
-        # Set the Client
-        client = sdmx.Client(Ecbexr.SDMX_CLIENT)
+        # Set the Client (provider can be e.g. 'ECB', 'IMF_DATA' or a base URL known by sdmx)
+        client = sdmx.Client(self.sdmx_provider)
 
         try:
             # Step 1: Get daily data ONLY for the target month to get month-end closing rate - limiting the number of days as only the last quotation day is needed
@@ -153,30 +169,62 @@ class Ecbexr:
             daily_end = f"{self.end_year}-{self.end_month:02d}-{last_day:02d}"
 
             # print(f"Fetching daily data for month-end rates: {daily_start} to {daily_end}...")
+            if self.sdmx_daily_key:
+                daily_response = client.data(
+                    self.sdmx_dataset,
+                    key=self.sdmx_daily_key,
+                    params={"startPeriod": daily_start, "endPeriod": daily_end},
+                )
 
-            daily_response = client.data(
-                Ecbexr.SDMX_DATASET,
-                key=Ecbexr.SDMX_DAILY_KEY,
-                params={"startPeriod": daily_start, "endPeriod": daily_end},
-            )
-
-            daily_df = sdmx.to_pandas(daily_response.data)
+                daily_df = sdmx.to_pandas(daily_response.data)
+                # normalize Series -> DataFrame
+                if isinstance(daily_df, pd.Series):
+                    daily_df = daily_df.reset_index().rename(columns={0: 'value'})
+            else:
+                # No daily key provided: attempt to fetch the dataset without a series key
+                # (this will retrieve all series for the dataset within the period)
+                try:
+                    daily_response = client.data(
+                        self.sdmx_dataset,
+                        params={"startPeriod": daily_start, "endPeriod": daily_end},
+                    )
+                    daily_df = sdmx.to_pandas(daily_response.data)
+                    if isinstance(daily_df, pd.Series):
+                        daily_df = daily_df.reset_index().rename(columns={0: 'value'})
+                except Exception:
+                    # Provider may not support daily data or the request may be too large
+                    daily_df = pd.DataFrame()
 
             # Step 2: Get monthly data from start month+year to target month for averages
             monthly_start = f"{self.start_year}-{self.start_month:02d}"
             monthly_end = f"{self.end_year}-{self.end_month:02d}"
 
             # print(f"Fetching monthly data for averages: {monthly_start} to {monthly_end}...")
+            if self.sdmx_monthly_key:
+                monthly_response = client.data(
+                    self.sdmx_dataset,
+                    key=self.sdmx_monthly_key,
+                    params={"startPeriod": monthly_start, "endPeriod": monthly_end},
+                )
 
-            monthly_response = client.data(
-                Ecbexr.SDMX_DATASET,
-                key=Ecbexr.SDMX_MONTHLY_KEY,
-                params={"startPeriod": monthly_start, "endPeriod": monthly_end},
-            )
+                monthly_df = sdmx.to_pandas(monthly_response.data)
+                if isinstance(monthly_df, pd.Series):
+                    monthly_df = monthly_df.reset_index().rename(columns={0: 'value'})
+            else:
+                # No monthly key provided: fetch all series for the dataset (may be large)
+                try:
+                    monthly_response = client.data(
+                        self.sdmx_dataset,
+                        params={"startPeriod": monthly_start, "endPeriod": monthly_end},
+                    )
+                    monthly_df = sdmx.to_pandas(monthly_response.data)
+                    if isinstance(monthly_df, pd.Series):
+                        monthly_df = monthly_df.reset_index().rename(columns={0: 'value'})
+                except Exception:
+                    monthly_df = pd.DataFrame()
 
-            monthly_df = sdmx.to_pandas(monthly_response.data)
-
-            if daily_df.empty or monthly_df.empty:
+            # If both daily and monthly data are empty, nothing to do
+            if daily_df.empty and monthly_df.empty:
                 print("No valid data retrieved.")
                 return {}
 
@@ -220,7 +268,7 @@ class Ecbexr:
                     daily_df = daily_df.sort_values(["date", daily_currency_col])
 
                     for currency in daily_df[daily_currency_col].unique():
-                        if pd.isna(currency) or currency == "EUR":
+                        if pd.isna(currency):
                             continue
 
                         currency_daily = daily_df[
@@ -251,9 +299,21 @@ class Ecbexr:
                 monthly_df = monthly_df.reset_index()
 
                 if "TIME_PERIOD" in monthly_df.columns:
-                    monthly_df["month_period"] = pd.to_datetime(
-                        monthly_df["TIME_PERIOD"]
-                    )
+                    # IMF uses format like '2025-M01', '2025-M10'
+                    # Parse more carefully for IMF format
+                    def parse_imf_period(period_str):
+                        try:
+                            # Format: YYYY-M## e.g., 2025-M10
+                            if isinstance(period_str, str) and 'M' in period_str:
+                                year, month_str = period_str.split('-M')
+                                month = int(month_str)
+                                return pd.Timestamp(year=int(year), month=month, day=1)
+                            else:
+                                return pd.to_datetime(period_str)
+                        except Exception:
+                            return pd.to_datetime(period_str)
+                    
+                    monthly_df["month_period"] = monthly_df["TIME_PERIOD"].apply(parse_imf_period)
                 else:
                     date_cols = [
                         col
@@ -265,12 +325,17 @@ class Ecbexr:
                             monthly_df[date_cols[0]]
                         )
 
-                # Identify currency and value columns
+                # Identify currency and value columns (different sources have different structures)
                 monthly_currency_col = None
+                indicator_col = None
+                country_col = None
                 for col in monthly_df.columns:
                     if "CURRENCY" in col.upper() and "DENOM" not in col.upper():
                         monthly_currency_col = col
-                        break
+                    elif col.upper() == "INDICATOR":
+                        indicator_col = col
+                    elif col.upper() == "COUNTRY":
+                        country_col = col
 
                 monthly_value_col = (
                     "value"
@@ -278,23 +343,23 @@ class Ecbexr:
                     else monthly_df.select_dtypes(include=[np.number]).columns[-1]
                 )
 
+                # Filter to current year and up to target month (for all sources)
+                monthly_df = monthly_df[
+                    (
+                        (monthly_df["month_period"].dt.year == self.end_year)
+                        & (monthly_df["month_period"].dt.month <= self.end_month)
+                    )
+                    | (
+                        (monthly_df["month_period"].dt.year == self.start_year)
+                        & (monthly_df["month_period"].dt.month >= self.start_month)
+                    )
+                ]
+
+                # ECB format: use CURRENCY column
                 if monthly_currency_col:
                     # print(f"Monthly - Currency column: {monthly_currency_col}, Value column: {monthly_value_col}")
-
-                    # Filter to current year and up to target month
-                    monthly_df = monthly_df[
-                        (
-                            (monthly_df["month_period"].dt.year == self.end_year)
-                            & (monthly_df["month_period"].dt.month <= self.end_month)
-                        )
-                        | (
-                            (monthly_df["month_period"].dt.year == self.start_year)
-                            & (monthly_df["month_period"].dt.month >= self.start_month)
-                        )
-                    ]
-
                     for currency in monthly_df[monthly_currency_col].unique():
-                        if pd.isna(currency) or currency == "EUR":
+                        if pd.isna(currency):
                             continue
 
                         currency_monthly = monthly_df[
@@ -324,6 +389,163 @@ class Ecbexr:
                                 currency_monthly[monthly_value_col].mean()
                             )
 
+                # IMF ER format: country-indexed exchange rates
+                elif indicator_col and country_col:
+                    # IMF ER dataset: each COUNTRY has exchange rates (EUR_XDC, USD_XDC, etc.)
+                    # Map country codes to standard 3-letter currency codes
+                    # Source: ISO 4217 currency codes for IMF member countries
+                    country_to_currency = {
+                        'ABW': 'AWG', 'AFG': 'AFN', 'AGO': 'AOA', 'AIA': 'XCD', 'ALA': 'EUR',
+                        'ALB': 'ALL', 'AND': 'EUR', 'ARE': 'AED', 'ARG': 'ARS', 'ARM': 'AMD',
+                        'ATG': 'XCD', 'AUS': 'AUD', 'AUT': 'EUR', 'AZE': 'AZN',
+                        'BDI': 'BIF', 'BEL': 'EUR', 'BEN': 'XOF', 'BES': 'USD', 'BFA': 'XOF',
+                        'BGD': 'BDT', 'BGR': 'BGN', 'BHR': 'BHD', 'BHS': 'BSD', 'BIH': 'BAM',
+                        'BLR': 'BYN', 'BLZ': 'BZD', 'BMU': 'BMD', 'BOL': 'BOB', 'BRA': 'BRL',
+                        'BRB': 'BBD', 'BRN': 'BND', 'BTN': 'BTN', 'BWA': 'BWP', 'CAF': 'XAF',
+                        'CAN': 'CAD', 'CHE': 'CHF', 'CHL': 'CLP', 'CHN': 'CNY', 'CIV': 'XOF',
+                        'CMR': 'XAF', 'COL': 'COP', 'COM': 'KMF', 'CPV': 'CVE', 'CRI': 'CRC',
+                        'CUB': 'CUP', 'CUW': 'ANG', 'CYP': 'EUR', 'CZE': 'CZK',
+                        'DEU': 'EUR', 'DJI': 'DJF', 'DMA': 'XCD', 'DNK': 'DKK', 'DOM': 'DOP',
+                        'DZA': 'DZD',
+                        'ECU': 'USD', 'EGY': 'EGP', 'ERI': 'ERN', 'ESH': 'MAD', 'ESP': 'EUR',
+                        'EST': 'EUR', 'ETH': 'ETB',
+                        'FIN': 'EUR', 'FJI': 'FJD', 'FLK': 'FKP', 'FRA': 'EUR', 'FRO': 'DKK',
+                        'FSM': 'USD',
+                        'GAB': 'XAF', 'GBR': 'GBP', 'GEO': 'GEL', 'GHA': 'GHS', 'GIB': 'GIP',
+                        'GRD': 'XCD', 'GRC': 'EUR', 'GRL': 'DKK', 'GTM': 'GTQ', 'GUM': 'USD',
+                        'GUY': 'GYD',
+                        'HKG': 'HKD', 'HND': 'HNL', 'HRV': 'HRK', 'HTI': 'HTG', 'HUN': 'HUF',
+                        'IDN': 'IDR', 'IND': 'INR', 'IRL': 'EUR', 'IRN': 'IRR', 'IRQ': 'IQD',
+                        'ISL': 'ISK', 'ISR': 'ILS', 'ITA': 'EUR',
+                        'JAM': 'JMD', 'JOR': 'JOD', 'JPN': 'JPY',
+                        'KAZ': 'KZT', 'KEN': 'KES', 'KGZ': 'KGS', 'KHM': 'KHR', 'KIR': 'AUD',
+                        'KNA': 'XCD', 'KOR': 'KRW', 'KWT': 'KWD',
+                        'LAO': 'LAK', 'LBN': 'LBP', 'LBR': 'LRD', 'LBY': 'LYD', 'LCA': 'XCD',
+                        'LIE': 'CHF', 'LKA': 'LKR', 'LSO': 'LSL', 'LTU': 'EUR', 'LUX': 'EUR',
+                        'LVA': 'EUR',
+                        'MAC': 'MOP', 'MAF': 'ANG', 'MAR': 'MAD', 'MCO': 'EUR', 'MDA': 'MDL',
+                        'MDG': 'MGA', 'MEX': 'MXN', 'MHL': 'USD', 'MKD': 'MKD', 'MLI': 'XOF',
+                        'MLT': 'EUR', 'MMR': 'MMK', 'MNE': 'EUR', 'MNG': 'MNT', 'MNP': 'USD',
+                        'MOZ': 'MZN', 'MRT': 'MRU', 'MUS': 'MUR', 'MDV': 'MVR', 'MWI': 'MWK',
+                        'MYS': 'MYR',
+                        'NAM': 'NAD', 'NCL': 'XPF', 'NER': 'XOF', 'NFK': 'AUD', 'NGA': 'NGN',
+                        'NIC': 'NIO', 'NLD': 'EUR', 'NOR': 'NOK', 'NPL': 'NPR', 'NRU': 'AUD',
+                        'NZL': 'NZD',
+                        'OMN': 'OMR',
+                        'PAK': 'PKR', 'PAN': 'PAB', 'PCN': 'NZD', 'PER': 'PEN', 'PHL': 'PHP',
+                        'PLW': 'USD', 'PNG': 'PGK', 'POL': 'PLN', 'PRI': 'USD', 'PRK': 'KPW',
+                        'PRT': 'EUR', 'PRY': 'PYG',
+                        'QAT': 'QAR',
+                        'ROU': 'RON', 'RUS': 'RUB', 'RWA': 'RWF',
+                        'SAU': 'SAR', 'SDN': 'SDG', 'SEN': 'XOF', 'SGP': 'SGD', 'SHN': 'SHP',
+                        'SJM': 'NOK', 'SVK': 'EUR', 'SVN': 'EUR', 'SWE': 'SEK', 'SWZ': 'SZL',
+                        'SXM': 'ANG', 'SYC': 'SCR', 'SYR': 'SYP',
+                        'TCA': 'USD', 'TCD': 'XAF', 'TGO': 'XOF', 'THA': 'THB', 'TJK': 'TJS',
+                        'TKL': 'NZD', 'TKM': 'TMT', 'TLS': 'USD', 'TON': 'TOP', 'TTO': 'TTD',
+                        'TUN': 'TND', 'TUR': 'TRY', 'TUV': 'AUD', 'TWN': 'TWD', 'TZA': 'TZS',
+                        'UGA': 'UGX', 'UKR': 'UAH', 'URY': 'UYU', 'USA': 'USD', 'UZB': 'UZS',
+                        'VAT': 'EUR', 'VCT': 'XCD', 'VEN': 'VES', 'VGB': 'USD', 'VIR': 'USD',
+                        'VNM': 'VND',
+                        'VUT': 'VUV',
+                        'WLF': 'XPF', 'WSM': 'WST',
+                        'YEM': 'YER',
+                        'ZAF': 'ZAR', 'ZMB': 'ZMW', 'ZWE': 'ZWL',
+                    }
+                    
+                    for country in monthly_df[country_col].unique():
+                        if pd.isna(country):
+                            continue
+                        
+                        # Map country code to currency code
+                        currency_code = country_to_currency.get(country, country)
+                        
+                        # Get all data for this country
+                        country_data = monthly_df[monthly_df[country_col] == country].copy()
+                        
+                        # For IMF, we'll use USD_XDC rates (USD per country's currency)
+                        # Filter to USD_XDC indicator (USD as base currency)
+                        usd_xdc_data = country_data[country_data[indicator_col] == 'USD_XDC'].copy()
+                        
+                        if len(usd_xdc_data) == 0:
+                            continue
+                        
+                        # Separate period average and end of period
+                        if 'TYPE_OF_TRANSFORMATION' in usd_xdc_data.columns:
+                            pa_data = usd_xdc_data[usd_xdc_data['TYPE_OF_TRANSFORMATION'] == 'PA_RT'].copy()
+                            eop_data = usd_xdc_data[usd_xdc_data['TYPE_OF_TRANSFORMATION'] == 'EOP_RT'].copy()
+                        else:
+                            pa_data = usd_xdc_data.copy()
+                            eop_data = usd_xdc_data.copy()
+                        
+                        pa_data = pa_data.dropna(subset=[monthly_value_col])
+                        eop_data = eop_data.dropna(subset=[monthly_value_col])
+                        
+                        # Period average (month_average)
+                        if len(pa_data) > 0:
+                            pa_data = pa_data.sort_values("month_period")
+                            target_month_data = pa_data[
+                                pa_data["month_period"].dt.month == self.end_month
+                            ]
+                            if len(target_month_data) > 0:
+                                monthly_averages[currency_code] = float(
+                                    target_month_data.iloc[0][monthly_value_col]
+                                )
+                            ytd_averages[currency_code] = float(pa_data[monthly_value_col].mean())
+                        
+                        # End of period (closing rate)
+                        if len(eop_data) > 0:
+                            eop_data = eop_data.sort_values("month_period")
+                            target_month_data = eop_data[
+                                eop_data["month_period"].dt.month == self.end_month
+                            ]
+                            if len(target_month_data) > 0:
+                                closing_rates[currency_code] = {
+                                    "rate": float(target_month_data.iloc[0][monthly_value_col]),
+                                    "date": None  # IMF only provides month, not specific dates
+                                }
+                    
+                    # Special handling for EUR: extract from USD data using XDC_EUR indicator
+                    # For USA (where USD is the local currency), XDC_EUR tells us EUR per USD
+                    usa_data = monthly_df[monthly_df[country_col] == 'USA'].copy()
+                    if len(usa_data) > 0:
+                        # Get XDC_EUR rates (EUR per 1 USD)
+                        xdc_eur_data = usa_data[usa_data[indicator_col] == 'XDC_EUR'].copy()
+                        if len(xdc_eur_data) > 0:
+                            # Separate period average and end of period
+                            if 'TYPE_OF_TRANSFORMATION' in xdc_eur_data.columns:
+                                pa_data = xdc_eur_data[xdc_eur_data['TYPE_OF_TRANSFORMATION'] == 'PA_RT'].copy()
+                                eop_data = xdc_eur_data[xdc_eur_data['TYPE_OF_TRANSFORMATION'] == 'EOP_RT'].copy()
+                            else:
+                                pa_data = xdc_eur_data.copy()
+                                eop_data = xdc_eur_data.copy()
+                            
+                            pa_data = pa_data.dropna(subset=[monthly_value_col])
+                            eop_data = eop_data.dropna(subset=[monthly_value_col])
+                            
+                            # Period average for EUR
+                            if len(pa_data) > 0:
+                                pa_data = pa_data.sort_values("month_period")
+                                target_month_data = pa_data[
+                                    pa_data["month_period"].dt.month == self.end_month
+                                ]
+                                if len(target_month_data) > 0:
+                                    monthly_averages['EUR'] = float(
+                                        target_month_data.iloc[0][monthly_value_col]
+                                    )
+                                ytd_averages['EUR'] = float(pa_data[monthly_value_col].mean())
+                            
+                            # End of period for EUR
+                            if len(eop_data) > 0:
+                                eop_data = eop_data.sort_values("month_period")
+                                target_month_data = eop_data[
+                                    eop_data["month_period"].dt.month == self.end_month
+                                ]
+                                if len(target_month_data) > 0:
+                                    closing_rates['EUR'] = {
+                                        "rate": float(target_month_data.iloc[0][monthly_value_col]),
+                                        "date": None
+                                    }
+
             # Combine results
             all_currencies = (
                 set(closing_rates.keys())
@@ -333,8 +555,6 @@ class Ecbexr:
 
             results = {}
             for currency in all_currencies:
-                if currency == "EUR":
-                    continue
 
                 # Get closing rate
                 closing_rate = cast(
@@ -357,6 +577,19 @@ class Ecbexr:
                     "has_closing": closing_rate is not None,
                     "has_monthly": monthly_avg is not None,
                     "has_ytd": ytd_avg is not None,
+                }
+
+            # Add EUR for ECB source (ECB base currency is EUR, so 1 EUR = 1 EUR)
+            if self.sdmx_provider == "ECB" and "EUR" not in results:
+                results["EUR"] = {
+                    "Currency": "EUR",
+                    "Closing": 1.0,
+                    "Month_Average": 1.0,
+                    "YTD_Average": 1.0,
+                    "Period": closing_date if closing_date else None,
+                    "has_closing": True,
+                    "has_monthly": True,
+                    "has_ytd": True,
                 }
 
             # print(f"✓ Successfully processed {len(results)} currencies")
@@ -506,6 +739,30 @@ if __name__ == "__main__":
         type=str,
         help="Path for the generated file (optional - default = application folder)",
     )
+    parser.add_argument(
+        "-s",
+        "--source",
+        type=str,
+        choices=["ECB", "IMF"],
+        default="ECB",
+        help="Data source: 'ECB' or 'IMF' (default = ECB)",
+    )
+    parser.add_argument(
+        "--daily-key",
+        type=str,
+        help="Override daily series key for the selected source (optional)",
+    )
+    parser.add_argument(
+        "--monthly-key",
+        type=str,
+        help="Override monthly series key for the selected source (optional)",
+    )
+    parser.add_argument(
+        "-b",
+        "--base-currency",
+        type=str,
+        help="Convert all rates to be relative to this base currency (optional)",
+    )
 
     # Parse the arguments
     args = parser.parse_args()
@@ -513,20 +770,92 @@ if __name__ == "__main__":
     sdmx_year = None if args.year == None else args.year
     sdmx_month = None if args.month == None else args.month
     sdmx_start = None if args.start == None else args.start
+    source = args.source.upper()
+    override_daily_key = args.daily_key
+    override_monthly_key = args.monthly_key
+    base_currency = args.base_currency.upper() if args.base_currency else None
+
+    # Define provider/dataset/key mapping for supported sources
+    SOURCE_MAP = {
+        "ECB": {
+            "provider": "ECB",
+            "dataset": "EXR",
+            "daily_key": "D..EUR.SP00.A",
+            "monthly_key": "M..EUR.SP00.A",
+        },
+        "IMF": {
+            # IMF SDMX registry uses 'IMF_DATA' for the client in the sdmx library
+            # Use the IMF Exchange Rates dataflow 'ER' by default (contains period average and end-of-period rates)
+            "provider": "IMF_DATA",
+            "dataset": "ER",
+            "daily_key": None,
+            "monthly_key": None,
+        },
+    }
+
+    if source not in SOURCE_MAP:
+        print(f"Unknown source '{source}', defaulting to ECB")
+        source = "ECB"
+
+    src_info = SOURCE_MAP[source]
+    provider = src_info.get("provider")
+    dataset = src_info.get("dataset")
+    daily_key = override_daily_key if override_daily_key is not None else src_info.get("daily_key")
+    monthly_key = override_monthly_key if override_monthly_key is not None else src_info.get("monthly_key")
     output: str | None = (
         "screen" if args.format == None else args.format.strip().lower()
     )
 
-    #print(f"{datetime.now()}: Retrieving exchange rates from the ECB for the provided arguments...")
-    ecbexr = Ecbexr(sdmx_year, sdmx_month, sdmx_start)
+    #print(f"{datetime.now()}: Retrieving exchange rates from the selected source for the provided arguments...")
+    ecbexr = Ecbexr(sdmx_year, sdmx_month, sdmx_start, provider=provider, dataset=dataset, daily_key=daily_key, monthly_key=monthly_key)
+
+    # If IMF is selected and no monthly key is provided, we'll fetch the dataset without a series key
+    # which retrieves all series for the dataset (may be large). This mirrors ECB behaviour
+    # where the default keys include all currencies.
+    if source == "IMF" and monthly_key is None:
+        print(
+            "IMF source selected with no monthly key: the script will fetch all series in the IMF dataset (may be large)."
+        )
     rates_dict = ecbexr.rates()
+
+    # If no data was retrieved, exit gracefully instead of failing later
+    if not rates_dict:
+        print("No rates available. Exiting.")
+        sys.exit(0)
+    
+    # Apply base currency conversion if specified
+    if base_currency:
+        if base_currency in rates_dict:
+            # Create a copy of the base_rate_dict to avoid modifying it as we iterate
+            import copy
+            base_rate_dict = copy.copy(rates_dict[base_currency])
+            numeric_columns = ['Closing', 'Month_Average', 'YTD_Average']
+            
+            for currency_code in rates_dict:
+                for col in numeric_columns:
+                    if col in rates_dict[currency_code]:
+                        current_val = rates_dict[currency_code][col]
+                        base_val = base_rate_dict.get(col)
+                        
+                        # If both values exist and base_val is not zero, divide
+                        if current_val is not None and base_val is not None and base_val != 0:
+                            rates_dict[currency_code][col] = current_val / base_val
+                        elif base_val == 0 or base_val is None:
+                            # If base rate is zero or None, set to zero
+                            rates_dict[currency_code][col] = 0
+        else:
+            print(f"Warning: Base currency '{base_currency}' not found in retrieved data. No conversion applied.")
+            print(f"Available currencies: {', '.join(sorted(rates_dict.keys()))}")
 
     if args.path is not None:
         base_dir = Path(args.path)
     else:
         # __file__ = chemin du script, .parent = répertoire du script
         base_dir = Path(__file__).parent
-    filename = base_dir / f"ExchangeRates_{ecbexr.end_year}-{ecbexr.end_month:02d}"
+    
+    # Build filename with source and base currency information
+    base_currency_str = base_currency if base_currency else "original"
+    filename = base_dir / f"ExchangeRates_{source}_{base_currency_str}_{ecbexr.end_year}-{ecbexr.end_month:02d}"
 
     # Convert dictionary to table
     #print(f"{datetime.now()}: Preparing data...")
@@ -644,7 +973,7 @@ if __name__ == "__main__":
     else:
 
         print(
-            f"\n Retrieving rates from ECB for period {ecbexr.end_year}-{ecbexr.end_month:02d} using {ecbexr.start_month:02d} as starting month",
+            f"\n Retrieving rates from {source} for period {ecbexr.end_year}-{ecbexr.end_month:02d} using {ecbexr.start_month:02d} as starting month",
             "\n",
             "=" * 70,
         )
